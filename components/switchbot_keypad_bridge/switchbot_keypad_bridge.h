@@ -20,6 +20,13 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/preferences.h"
 
+#ifdef USE_SKB_ACCESS_CONTROL
+#include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/switch/switch.h"
+#include "esphome/components/time/real_time_clock.h"
+#endif
+
+#include "access_rules.h"
 #include "keypad_advert.h"
 #include "keypad_state.h"
 #include "lock_advert.h"
@@ -97,6 +104,25 @@ class SwitchbotKeypadBridge : public Component {
   void add_on_doorbell_callback(std::function<void()> &&callback) {
     this->on_doorbell_callbacks_.add(std::move(callback));
   }
+  // Fired instead of on_unlock when the access schedule rejects an unlock:
+  // (method, credential index, reason).
+  void add_on_denied_callback(std::function<void(std::string, int, std::string)> &&callback) {
+    this->on_denied_callbacks_.add(std::move(callback));
+  }
+
+#ifdef USE_SKB_ACCESS_CONTROL
+  void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
+  void set_clock_synced_binary_sensor(binary_sensor::BinarySensor *sensor) {
+    this->clock_synced_sensor_ = sensor;
+  }
+  void set_access_rules_text_sensor(text_sensor::TextSensor *sensor) {
+    this->access_rules_sensor_ = sensor;
+  }
+  void set_access_control_enabled(bool enabled);
+  // Validates, persists and applies a rule string (see access_rules.h).
+  // Invalid rules are rejected and the current ones stay in force.
+  bool set_access_rules(const std::string &rules);
+#endif
 
  protected:
   class ServerCallbacks;
@@ -170,6 +196,7 @@ class SwitchbotKeypadBridge : public Component {
   void publish_lock_();
   void publish_unlock_(UnlockMethod method, int index);
   void publish_doorbell_();
+  void publish_denied_(UnlockMethod method, int index, const char *reason);
   void publish_linked_lock_();
 
   // ----- Battery refresh (advertisement scan) --------------------------------
@@ -242,6 +269,24 @@ class SwitchbotKeypadBridge : public Component {
   CallbackManager<void()> on_lock_callbacks_{};
   CallbackManager<void(std::string, int)> on_unlock_callbacks_{};
   CallbackManager<void()> on_doorbell_callbacks_{};
+  CallbackManager<void(std::string, int, std::string)> on_denied_callbacks_{};
+
+#ifdef USE_SKB_ACCESS_CONTROL
+  // ----- Access schedule -----------------------------------------------------
+
+  // Local time from the configured clock; invalid until it has synced.
+  AccessRules::Clock local_clock_() const;
+  void update_clock_synced_();
+  void publish_access_rules_status_(const char *error = nullptr);
+
+  time::RealTimeClock *clock_{nullptr};
+  binary_sensor::BinarySensor *clock_synced_sensor_{nullptr};
+  text_sensor::TextSensor *access_rules_sensor_{nullptr};
+  AccessRules access_rules_{};
+  ESPPreferenceObject access_rules_pref_;
+  bool access_control_enabled_{false};
+  uint32_t last_clock_check_{0};
+#endif
 
   // ----- User configuration --------------------------------------------------
 
@@ -317,6 +362,21 @@ class ResetButton : public button::Button, public Parented<SwitchbotKeypadBridge
  protected:
   void press_action() override;
 };
+
+#ifdef USE_SKB_ACCESS_CONTROL
+// Master switch for the access schedule. Its state is restored on boot (per
+// restore_mode), so enforcement never depends on Home Assistant being up.
+class AccessControlSwitch : public switch_::Switch,
+                            public Component,
+                            public Parented<SwitchbotKeypadBridge> {
+ public:
+  void setup() override;
+  void dump_config() override;
+
+ protected:
+  void write_state(bool state) override;
+};
+#endif
 
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome

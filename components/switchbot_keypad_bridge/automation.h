@@ -15,6 +15,18 @@ template<typename... Ts> class RearmAction : public Action<Ts...> {
   SwitchbotKeypadBridge *parent_;
 };
 
+#ifdef USE_SKB_ACCESS_CONTROL
+template<typename... Ts> class SetAccessRulesAction : public Action<Ts...> {
+ public:
+  explicit SetAccessRulesAction(SwitchbotKeypadBridge *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(std::string, rules)
+  void play(const Ts &...x) override { this->parent_->set_access_rules(this->rules_.value(x...)); }
+
+ protected:
+  SwitchbotKeypadBridge *parent_;
+};
+#endif
+
 class LockTrigger : public Trigger<> {
  public:
   explicit LockTrigger(SwitchbotKeypadBridge *parent) {
@@ -34,6 +46,16 @@ class DoorbellTrigger : public Trigger<> {
  public:
   explicit DoorbellTrigger(SwitchbotKeypadBridge *parent) {
     parent->add_on_doorbell_callback([this]() { this->trigger(); });
+  }
+};
+
+class DeniedTrigger : public Trigger<std::string, int, std::string> {
+ public:
+  explicit DeniedTrigger(SwitchbotKeypadBridge *parent) {
+    parent->add_on_denied_callback(
+        [this](const std::string &method, int index, const std::string &reason) {
+          this->trigger(method, index, reason);
+        });
   }
 };
 

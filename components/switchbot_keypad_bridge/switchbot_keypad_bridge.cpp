@@ -187,6 +187,22 @@ void SwitchbotKeypadBridge::setup() {
   this->lock_linked_ = this->linked_lock_info_.valid != 0;
   this->pairing_ui_.set_lock_linked(this->lock_linked_);
   this->publish_linked_lock_();
+
+#ifdef USE_SKB_ACCESS_CONTROL
+  // Restore the access schedule pushed earlier; it is enforced from boot,
+  // with or without Home Assistant.
+  this->access_rules_pref_ = global_preferences->make_preference<std::array<char, ACCESS_RULES_MAX>>(
+      0x5341434CUL /* 'SACL' */);
+  std::array<char, ACCESS_RULES_MAX> stored_rules{};
+  if (this->access_rules_pref_.load(&stored_rules)) {
+    stored_rules.back() = '\0';
+    std::string error;
+    if (!this->access_rules_.parse(stored_rules.data(), error)) {
+      ESP_LOGW(TAG, "Ignoring stored access rules: %s", error.c_str());
+    }
+  }
+  this->publish_access_rules_status_();
+#endif
   this->battery_scan_callbacks_ = new BatteryScanCallbacks(this);
   this->next_battery_scan_at_ = millis() + BATTERY_SCAN_RETRY_MS;
   if (!this->lock_linked_) {
@@ -242,6 +258,9 @@ void SwitchbotKeypadBridge::loop() {
   this->apply_pending_lock_link_();
   this->apply_pending_lock_relay_();
   this->update_rearm_timer_();
+#ifdef USE_SKB_ACCESS_CONTROL
+  this->update_clock_synced_();
+#endif
 
   // Idle-close the wizard only once a keypad is linked: with nothing linked
   // the wizard is the device's whole purpose ("setup mode") and must stay
@@ -421,6 +440,98 @@ void ResetButton::press_action() {
   this->parent_->reset_pairing();
 }
 
+#ifdef USE_SKB_ACCESS_CONTROL
+// ---------------------------------------------------------------------------
+// Access schedule
+// ---------------------------------------------------------------------------
+
+void SwitchbotKeypadBridge::set_access_control_enabled(bool enabled) {
+  if (this->access_control_enabled_ != enabled) {
+    ESP_LOGI(TAG, "Access control %s", enabled ? "enabled" : "disabled");
+  }
+  this->access_control_enabled_ = enabled;
+}
+
+bool SwitchbotKeypadBridge::set_access_rules(const std::string &rules) {
+  if (rules == this->access_rules_.text()) {
+    ESP_LOGD(TAG, "Access rules unchanged (%u group(s))",
+             static_cast<unsigned>(this->access_rules_.group_count()));
+    this->publish_access_rules_status_();
+    return true;
+  }
+  std::string error;
+  if (!this->access_rules_.parse(rules, error)) {
+    ESP_LOGW(TAG, "Rejected access rules, keeping the current ones: %s", error.c_str());
+    this->publish_access_rules_status_(error.c_str());
+    return false;
+  }
+  // parse() guarantees the text fits, NUL included.
+  std::array<char, ACCESS_RULES_MAX> buf{};
+  std::memcpy(buf.data(), rules.data(), rules.size());
+  this->access_rules_pref_.save(&buf);
+  global_preferences->sync();
+  ESP_LOGI(TAG, "Access rules updated: %u group(s)",
+           static_cast<unsigned>(this->access_rules_.group_count()));
+  this->publish_access_rules_status_();
+  return true;
+}
+
+AccessRules::Clock SwitchbotKeypadBridge::local_clock_() const {
+  AccessRules::Clock clock;
+  if (this->clock_ == nullptr) return clock;
+  const ESPTime now = this->clock_->now();
+  if (!now.is_valid()) return clock;
+  clock.valid = true;
+  // ESPTime counts weekdays from Sunday = 1; the rules from Monday = 0.
+  clock.weekday = static_cast<uint8_t>((now.day_of_week + 5) % 7);
+  clock.minute = static_cast<uint16_t>(now.hour * 60 + now.minute);
+  clock.timestamp = static_cast<int64_t>(now.timestamp);
+  return clock;
+}
+
+void SwitchbotKeypadBridge::update_clock_synced_() {
+  if (this->clock_synced_sensor_ == nullptr) return;
+  const uint32_t now = millis();
+  if (this->last_clock_check_ != 0 && now - this->last_clock_check_ < 10000) return;
+  this->last_clock_check_ = now == 0 ? 1 : now;
+  const bool synced = this->local_clock_().valid;
+  if (!this->clock_synced_sensor_->has_state() || this->clock_synced_sensor_->state != synced) {
+    if (!synced) {
+      ESP_LOGW(TAG, "Clock not synchronised: access schedule falls back to allowing everyone");
+    }
+    this->clock_synced_sensor_->publish_state(synced);
+  }
+}
+
+// Short status for Home Assistant: lets an automation confirm that what it
+// pushed is what the ESP enforces (group count + length) or see why not.
+void SwitchbotKeypadBridge::publish_access_rules_status_(const char *error) {
+  if (this->access_rules_sensor_ == nullptr) return;
+  char buf[200];
+  if (error != nullptr) {
+    std::snprintf(buf, sizeof(buf), "error: %.120s (kept %u groups, %u chars)", error,
+                  static_cast<unsigned>(this->access_rules_.group_count()),
+                  static_cast<unsigned>(this->access_rules_.text().size()));
+  } else {
+    std::snprintf(buf, sizeof(buf), "ok: %u groups, %u chars",
+                  static_cast<unsigned>(this->access_rules_.group_count()),
+                  static_cast<unsigned>(this->access_rules_.text().size()));
+  }
+  this->access_rules_sensor_->publish_state(buf);
+}
+
+void AccessControlSwitch::setup() {
+  this->write_state(this->get_initial_state_with_restore_mode().value_or(false));
+}
+
+void AccessControlSwitch::dump_config() { LOG_SWITCH("", "Access control switch", this); }
+
+void AccessControlSwitch::write_state(bool state) {
+  this->parent_->set_access_control_enabled(state);
+  this->publish_state(state);
+}
+#endif
+
 void SwitchbotKeypadBridge::rearm() {
   this->keypad_state_.rearm();
   ESP_LOGI(TAG, "Reporting locked state on the next keypad poll (rearm)");
@@ -445,6 +556,12 @@ void SwitchbotKeypadBridge::dump_config() {
     ESP_LOGCONFIG(TAG, "  Battery refresh interval: %us",
                   static_cast<unsigned>(this->battery_scan_interval_ms_ / 1000));
   }
+#ifdef USE_SKB_ACCESS_CONTROL
+  ESP_LOGCONFIG(TAG, "  Access control: %s, %u rule group(s), clock %s",
+                this->access_control_enabled_ ? "ON" : "OFF",
+                static_cast<unsigned>(this->access_rules_.group_count()),
+                this->local_clock_().valid ? "synchronised" : "NOT synchronised");
+#endif
   if (this->is_failed()) {
     ESP_LOGE(TAG, "  Initialization failed - see previous errors");
   }
@@ -560,14 +677,34 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       this->publish_lock_();
       break;
 
-    case CommandType::UNLOCK:
+    case CommandType::UNLOCK: {
       ESP_LOGI(TAG, "Unlock: method=%s (0x%02X) index=%d",
                unlock_method_name(command.method),
                static_cast<uint8_t>(command.method), command.credential_index);
+#ifdef USE_SKB_ACCESS_CONTROL
+      const AccessRules::Decision decision = this->access_rules_.check(
+          this->access_control_enabled_, command.method, command.credential_index,
+          this->local_clock_());
+      if (!AccessRules::is_allowed(decision)) {
+        ESP_LOGW(TAG, "Access denied: method=%s index=%d (%s)",
+                 unlock_method_name(command.method), command.credential_index,
+                 AccessRules::decision_name(decision));
+        this->publish_denied_(command.method, command.credential_index,
+                              AccessRules::decision_name(decision));
+        // Answer the keypad like any unlock so it does not retry, but never
+        // relay to the physical lock and keep the emulated lock locked.
+        this->send_local_response_(header, command);
+        return;
+      }
+      if (decision == AccessRules::Decision::ALLOWED_NO_CLOCK) {
+        ESP_LOGW(TAG, "Clock not synchronised: access schedule skipped (fail open)");
+      }
+#endif
       // Start before callbacks so an on_unlock automation can rearm explicitly.
       this->keypad_state_.unlock(millis());
       this->publish_unlock_(command.method, command.credential_index);
       break;
+    }
 
     case CommandType::STATE_POLL:
       ESP_LOGV(TAG, "State poll");
@@ -786,6 +923,14 @@ void SwitchbotKeypadBridge::publish_doorbell_() {
     this->keypad_event_->trigger("Doorbell");
   }
   this->on_doorbell_callbacks_.call();
+}
+
+void SwitchbotKeypadBridge::publish_denied_(UnlockMethod method, int index, const char *reason) {
+  if (this->keypad_event_ != nullptr) {
+    this->keypad_event_->trigger("Denied");
+  }
+  this->on_denied_callbacks_.call(std::string(unlock_method_name(method)), index,
+                                  std::string(reason));
 }
 
 void SwitchbotKeypadBridge::publish_linked_lock_() {

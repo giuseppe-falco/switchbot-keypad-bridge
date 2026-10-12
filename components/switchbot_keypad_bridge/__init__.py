@@ -24,7 +24,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome import automation
-from esphome.components import button, event, sensor, text_sensor
+from esphome.components import binary_sensor, button, event, sensor, switch, text_sensor, time
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
@@ -32,6 +32,7 @@ from esphome.components.esp32 import (
 )
 from esphome.const import (
     CONF_ID,
+    CONF_TIME_ID,
     CONF_TRIGGER_ID,
     DEVICE_CLASS_BATTERY,
     ENTITY_CATEGORY_CONFIG,
@@ -45,7 +46,7 @@ LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@pierluigizagaria"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["event", "text_sensor", "button", "sensor"]
+AUTO_LOAD = ["event", "text_sensor", "button", "sensor", "switch", "binary_sensor"]
 MULTI_CONF = False
 
 CONF_KEYPAD_ACTION = "keypad_action"
@@ -60,6 +61,12 @@ CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
 CONF_ON_DOORBELL = "on_doorbell"
 CONF_PAIRING_UI = "pairing_ui"
+CONF_ON_DENIED = "on_denied"
+CONF_ACCESS_CONTROL = "access_control"
+CONF_ENABLE_SWITCH = "enable_switch"
+CONF_CLOCK_SYNCED = "clock_synced"
+CONF_RULES_STATUS = "rules_status"
+CONF_RULES = "rules"
 
 # Auto-generated id for the progmem array that carries the embedded UI.
 CONF_PAIRING_UI_HTML_ID = "pairing_ui_html_id"
@@ -83,6 +90,40 @@ UnlockTrigger = switchbot_keypad_bridge_ns.class_(
 )
 DoorbellTrigger = switchbot_keypad_bridge_ns.class_(
     "DoorbellTrigger", automation.Trigger.template()
+)
+DeniedTrigger = switchbot_keypad_bridge_ns.class_(
+    "DeniedTrigger", automation.Trigger.template(cg.std_string, cg.int_, cg.std_string)
+)
+AccessControlSwitch = switchbot_keypad_bridge_ns.class_(
+    "AccessControlSwitch", switch.Switch, cg.Component
+)
+SetAccessRulesAction = switchbot_keypad_bridge_ns.class_(
+    "SetAccessRulesAction", automation.Action
+)
+
+# Optional per-credential access schedule (see access_rules.h). Rules are
+# pushed at runtime with `switchbot_keypad_bridge.set_access_rules`, persisted
+# in NVS and evaluated against `time_id`, so enforcement keeps working when
+# Home Assistant is down. Unlisted credentials are always allowed; without a
+# valid clock every unlock is allowed (fail open).
+ACCESS_CONTROL_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
+        cv.Required(CONF_ENABLE_SWITCH): switch.switch_schema(
+            AccessControlSwitch,
+            entity_category=ENTITY_CATEGORY_CONFIG,
+            icon="mdi:account-lock",
+            default_restore_mode="RESTORE_DEFAULT_OFF",
+        ).extend(cv.COMPONENT_SCHEMA),
+        cv.Optional(CONF_CLOCK_SYNCED): binary_sensor.binary_sensor_schema(
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            icon="mdi:clock-check-outline",
+        ),
+        cv.Optional(CONF_RULES_STATUS): text_sensor.text_sensor_schema(
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+            icon="mdi:account-clock",
+        ),
+    }
 )
 
 
@@ -156,6 +197,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_DOORBELL): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DoorbellTrigger)}
         ),
+        cv.Optional(CONF_ACCESS_CONTROL): ACCESS_CONTROL_SCHEMA,
+        cv.Optional(CONF_ON_DENIED): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(DeniedTrigger)}
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -218,15 +263,37 @@ async def rearm_to_code(config, action_id, template_arg, args):
     return cg.new_Pvariable(action_id, template_arg, parent)
 
 
+# Requires `access_control:` on the bridge. Invalid rules are rejected by the
+# device (current rules stay in force) and reported on `rules_status`.
+@automation.register_action(
+    "switchbot_keypad_bridge.set_access_rules",
+    SetAccessRulesAction,
+    cv.Schema(
+        {
+            cv.Required(CONF_ID): cv.use_id(SwitchbotKeypadBridge),
+            cv.Required(CONF_RULES): cv.templatable(cv.string),
+        }
+    ),
+    synchronous=True,
+)
+async def set_access_rules_to_code(config, action_id, template_arg, args):
+    parent = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, parent)
+    rules = await cg.templatable(config[CONF_RULES], args, cg.std_string)
+    cg.add(var.set_rules(rules))
+    return var
+
+
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_rearm_after(config[CONF_REARM_AFTER].total_milliseconds))
 
     if keypad_conf := config.get(CONF_KEYPAD_ACTION):
-        keypad = await event.new_event(
-            keypad_conf, event_types=["Lock", "Unlock", "Doorbell"]
-        )
+        event_types = ["Lock", "Unlock", "Doorbell"]
+        if CONF_ACCESS_CONTROL in config:
+            event_types.append("Denied")
+        keypad = await event.new_event(keypad_conf, event_types=event_types)
         cg.add(var.set_keypad_event(keypad))
 
     if keypad_sensor_conf := config.get(CONF_KEYPAD):
@@ -288,6 +355,28 @@ async def to_code(config):
     for trig_conf in config.get(CONF_ON_DOORBELL, []):
         trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trig, [], trig_conf)
+
+    for trig_conf in config.get(CONF_ON_DENIED, []):
+        trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(
+            trig,
+            [(cg.std_string, "method"), (cg.int_, "index"), (cg.std_string, "reason")],
+            trig_conf,
+        )
+
+    if access_conf := config.get(CONF_ACCESS_CONTROL):
+        cg.add_define("USE_SKB_ACCESS_CONTROL")
+        clock = await cg.get_variable(access_conf[CONF_TIME_ID])
+        cg.add(var.set_time(clock))
+        sw = await switch.new_switch(access_conf[CONF_ENABLE_SWITCH])
+        await cg.register_component(sw, access_conf[CONF_ENABLE_SWITCH])
+        await cg.register_parented(sw, config[CONF_ID])
+        if synced_conf := access_conf.get(CONF_CLOCK_SYNCED):
+            sens = await binary_sensor.new_binary_sensor(synced_conf)
+            cg.add(var.set_clock_synced_binary_sensor(sens))
+        if status_conf := access_conf.get(CONF_RULES_STATUS):
+            sens = await text_sensor.new_text_sensor(status_conf)
+            cg.add(var.set_access_rules_text_sensor(sens))
 
     # NimBLE C++ wrapper, pulled as ESP-IDF managed component (no Python deps).
     add_idf_component(
