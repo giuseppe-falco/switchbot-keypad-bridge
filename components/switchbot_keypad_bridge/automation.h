@@ -15,7 +15,6 @@ template<typename... Ts> class RearmAction : public Action<Ts...> {
   SwitchbotKeypadBridge *parent_;
 };
 
-#ifdef USE_SKB_ACCESS_CONTROL
 template<typename... Ts> class SetAccessRulesAction : public Action<Ts...> {
  public:
   explicit SetAccessRulesAction(SwitchbotKeypadBridge *parent) : parent_(parent) {}
@@ -25,7 +24,6 @@ template<typename... Ts> class SetAccessRulesAction : public Action<Ts...> {
  protected:
   SwitchbotKeypadBridge *parent_;
 };
-#endif
 
 class LockTrigger : public Trigger<> {
  public:

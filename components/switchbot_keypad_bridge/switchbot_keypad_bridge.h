@@ -110,6 +110,11 @@ class SwitchbotKeypadBridge : public Component {
     this->on_denied_callbacks_.add(std::move(callback));
   }
 
+  // Validates, persists and applies a rule string (see access_rules.h).
+  // Invalid rules are rejected and the current ones stay in force. Without
+  // `access_control:` in the YAML it only logs a warning and returns false.
+  bool set_access_rules(const std::string &rules);
+
 #ifdef USE_SKB_ACCESS_CONTROL
   void set_time(time::RealTimeClock *clock) { this->clock_ = clock; }
   void set_clock_synced_binary_sensor(binary_sensor::BinarySensor *sensor) {
@@ -119,9 +124,6 @@ class SwitchbotKeypadBridge : public Component {
     this->access_rules_sensor_ = sensor;
   }
   void set_access_control_enabled(bool enabled);
-  // Validates, persists and applies a rule string (see access_rules.h).
-  // Invalid rules are rejected and the current ones stay in force.
-  bool set_access_rules(const std::string &rules);
 #endif
 
  protected:

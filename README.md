@@ -218,6 +218,73 @@ Supported lock families: Lock, Lock Lite, Lock Pro, Lock Pro Wi-Fi, Lock Ultra,
 Lock Vision and Lock Vision Pro. Keep the lock near the ESP32 during setup; the
 wizard only enables linking for locks it can see over BLE.
 
+## 🕒 Access schedule (optional)
+
+Restrict *when* each credential may open the door. The schedule lives on the
+ESP32: rules are pushed at runtime (e.g. by Home Assistant), saved to NVS and
+evaluated locally against the ESP's own clock, so they keep working while Home
+Assistant is down or in maintenance.
+
+```yaml
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Rome   # set it explicitly: windows are local time
+
+api:
+  actions:
+    - action: set_access_rules
+      variables:
+        rules: string
+      then:
+        - switchbot_keypad_bridge.set_access_rules:
+            id: keypad_bridge
+            rules: !lambda 'return rules;'
+
+switchbot_keypad_bridge:
+  id: keypad_bridge
+  access_control:
+    time_id: sntp_time
+    enable_switch:            # master switch, restored on boot (default OFF)
+      name: "Access control"
+    clock_synced:             # optional diagnostic binary sensor
+      name: "Clock synchronised"
+    rules_status:             # optional: "ok: <groups> groups, <chars> chars, #<hash>" or "error: ..."
+      name: "Access rules"
+  on_denied:                  # (method, index, reason) — the lock is NOT operated
+    - homeassistant.event:
+        event: esphome.switchbot_keypad_denied
+        data:
+          method: !lambda 'return method;'
+          index: !lambda 'return to_string(index);'
+          reason: !lambda 'return reason;'
+```
+
+Rule string (no spaces), one group per person:
+
+```
+f3,f5,p2=1F/0700-2300,60/0900-0200@1791936000;n1=7F/0600-2200
+```
+
+- credentials: `f`ingerprint, `p`in, `n`fc, fa`c`e, p`a`lm + slot index
+- windows: `daymask/HHMM-HHMM`, daymask in hex with bit0 = Monday … bit6 =
+  Sunday; `2400` is a valid end; an end not after the start crosses midnight
+  and belongs to the starting day
+- `@<unix time>`: optional temporary exception, allowed until then
+- a group with neither windows nor a running exception denies always
+
+Behaviour:
+
+- **Credentials not listed are always allowed**; with the switch off
+  everything is allowed, exactly as without `access_control`.
+- **No valid clock → allowed** (fail open) and logged; watch `clock_synced`.
+- A denied unlock is still acknowledged to the keypad (it shows success — the
+  protocol has no "refused" reply we know of), is **never relayed** to the
+  physical lock, keeps the emulated lock locked and fires `on_denied` plus a
+  `Denied` event type on `keypad_action` instead of `on_unlock`.
+- Invalid rules are rejected and the previous ones stay in force; identical
+  rules are not rewritten to flash.
+
 ## 🔔 Doorbell (Keypad Vision)
 
 The official app hides the doorbell button until a SwitchBot Lock is bound to
@@ -352,6 +419,10 @@ switchbot_keypad_bridge:
 | `on_lock` | automation | no | Triggered on every `lock` command. |
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |
 | `on_doorbell` | automation | no | Triggered on every doorbell press (Keypad Vision). No parameters. |
+| `access_control` | block | no | Optional access schedule: `time_id` (required), `enable_switch` (required), `clock_synced`, `rules_status`. See [Access schedule](#-access-schedule-optional). |
+| `on_denied` | automation | no | Triggered when the access schedule rejects an unlock — parameters `(std::string method, int index, std::string reason)`. |
+
+Automation action: `switchbot_keypad_bridge.set_access_rules` (`id`, templatable `rules`) replaces the access schedule (requires `access_control`).
 
 Automation action: `switchbot_keypad_bridge.rearm: <bridge_id>` (or
 `switchbot_keypad_bridge.rearm: {id: <bridge_id>}`) reports the emulated lock

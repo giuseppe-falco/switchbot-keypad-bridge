@@ -532,6 +532,11 @@ void AccessControlSwitch::write_state(bool state) {
   this->parent_->set_access_control_enabled(state);
   this->publish_state(state);
 }
+#else
+bool SwitchbotKeypadBridge::set_access_rules(const std::string &) {
+  ESP_LOGW(TAG, "set_access_rules ignored: add `access_control:` to switchbot_keypad_bridge");
+  return false;
+}
 #endif
 
 void SwitchbotKeypadBridge::rearm() {
