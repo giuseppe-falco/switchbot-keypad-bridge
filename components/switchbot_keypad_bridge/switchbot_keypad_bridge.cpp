@@ -504,18 +504,20 @@ void SwitchbotKeypadBridge::update_clock_synced_() {
 }
 
 // Short status for Home Assistant: lets an automation confirm that what it
-// pushed is what the ESP enforces (group count + length) or see why not.
+// pushed is what the ESP enforces (group count + length) or see why not. The
+// hash changes whenever the enforced rules change, even at equal length.
 void SwitchbotKeypadBridge::publish_access_rules_status_(const char *error) {
   if (this->access_rules_sensor_ == nullptr) return;
+  const std::string &text = this->access_rules_.text();
+  const unsigned groups = static_cast<unsigned>(this->access_rules_.group_count());
+  const unsigned chars = static_cast<unsigned>(text.size());
+  const unsigned hash = static_cast<unsigned>(fnv1_hash(text));
   char buf[200];
   if (error != nullptr) {
-    std::snprintf(buf, sizeof(buf), "error: %.120s (kept %u groups, %u chars)", error,
-                  static_cast<unsigned>(this->access_rules_.group_count()),
-                  static_cast<unsigned>(this->access_rules_.text().size()));
+    std::snprintf(buf, sizeof(buf), "error: %.120s (kept %u groups, %u chars, #%08x)", error,
+                  groups, chars, hash);
   } else {
-    std::snprintf(buf, sizeof(buf), "ok: %u groups, %u chars",
-                  static_cast<unsigned>(this->access_rules_.group_count()),
-                  static_cast<unsigned>(this->access_rules_.text().size()));
+    std::snprintf(buf, sizeof(buf), "ok: %u groups, %u chars, #%08x", groups, chars, hash);
   }
   this->access_rules_sensor_->publish_state(buf);
 }
