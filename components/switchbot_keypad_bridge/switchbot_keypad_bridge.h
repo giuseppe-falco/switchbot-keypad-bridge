@@ -27,6 +27,7 @@
 #endif
 
 #include "access_rules.h"
+#include "frame_throttle.h"
 #include "keypad_advert.h"
 #include "keypad_state.h"
 #include "lock_advert.h"
@@ -84,6 +85,15 @@ class SwitchbotKeypadBridge : public Component {
   }
   void set_battery_scan_interval(uint32_t ms) { this->battery_scan_interval_ms_ = ms; }
   void set_rearm_after(uint32_t ms) { this->keypad_state_.set_rearm_after(ms); }
+  // Forget the keypad's encrypted session this long after it disconnects
+  // (0 = keep it, upstream behaviour). Bounds how long an IV whose keystream
+  // may have been observed on air stays usable; see README "Security limits".
+  void set_session_idle_timeout(uint32_t ms) { this->session_idle_timeout_ms_ = ms; }
+  // After `limit` rejected keypad frames within `lockout_ms`, ignore the
+  // keypad for `lockout_ms` and fire on_tamper (0 = disabled).
+  void set_invalid_frame_limit(uint32_t limit, uint32_t lockout_ms) {
+    this->frame_throttle_.configure(limit, lockout_ms, lockout_ms);
+  }
 
   // Report LOCKED on the next keypad poll, without operating a physical lock
   // or publishing a Lock event. Safe to call from local ESPHome automations.
@@ -103,6 +113,9 @@ class SwitchbotKeypadBridge : public Component {
   }
   void add_on_doorbell_callback(std::function<void()> &&callback) {
     this->on_doorbell_callbacks_.add(std::move(callback));
+  }
+  void add_on_tamper_callback(std::function<void()> &&callback) {
+    this->on_tamper_callbacks_.add(std::move(callback));
   }
   // Fired instead of on_unlock when the access schedule rejects an unlock:
   // (method, credential index, reason).
@@ -310,6 +323,21 @@ class SwitchbotKeypadBridge : public Component {
   // crypto). The IV may survive BLE reconnects when the keypad continues the
   // same logical session. Only ever touched from the main task.
   LockSession session_{};
+  // Idle expiry of session_ (set_session_idle_timeout). Armed on the first
+  // disconnect of a committed IV generation and not re-armed by later
+  // reconnects of the same generation; only a real hand-over to a new
+  // generation (which needs the key) cancels it. A peer that merely connects,
+  // reconnects or requests its own IV therefore cannot keep an old IV alive.
+  void expire_idle_session_();
+  uint32_t session_idle_timeout_ms_{0};
+  uint32_t session_idle_since_{0};
+  uint32_t session_idle_generation_{0};
+  bool session_idle_armed_{false};
+
+  // Brute-force throttle on rejected frames (set_invalid_frame_limit).
+  void on_invalid_frame_flood_();
+  FrameThrottle frame_throttle_{};
+  CallbackManager<void()> on_tamper_callbacks_{};
 
   PhysicalLockClient physical_lock_client_{};
   LinkedLockInfo linked_lock_info_{};

@@ -47,6 +47,13 @@ class DoorbellTrigger : public Trigger<> {
   }
 };
 
+class TamperTrigger : public Trigger<> {
+ public:
+  explicit TamperTrigger(SwitchbotKeypadBridge *parent) {
+    parent->add_on_tamper_callback([this]() { this->trigger(); });
+  }
+};
+
 class DeniedTrigger : public Trigger<std::string, int, std::string> {
  public:
   explicit DeniedTrigger(SwitchbotKeypadBridge *parent) {

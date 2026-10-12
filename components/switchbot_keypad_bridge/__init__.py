@@ -56,6 +56,10 @@ CONF_KEYPAD_BATTERY_LEVEL = "keypad_battery_level"
 CONF_LOCK_BATTERY_LEVEL = "lock_battery_level"
 CONF_BATTERY_SCAN_INTERVAL = "battery_scan_interval"
 CONF_REARM_AFTER = "rearm_after"
+CONF_SESSION_IDLE_TIMEOUT = "session_idle_timeout"
+CONF_INVALID_FRAME_LIMIT = "invalid_frame_limit"
+CONF_INVALID_FRAME_LOCKOUT = "invalid_frame_lockout"
+CONF_ON_TAMPER = "on_tamper"
 CONF_RESET_BUTTON = "reset_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
@@ -93,6 +97,9 @@ DoorbellTrigger = switchbot_keypad_bridge_ns.class_(
 )
 DeniedTrigger = switchbot_keypad_bridge_ns.class_(
     "DeniedTrigger", automation.Trigger.template(cg.std_string, cg.int_, cg.std_string)
+)
+TamperTrigger = switchbot_keypad_bridge_ns.class_(
+    "TamperTrigger", automation.Trigger.template()
 )
 AccessControlSwitch = switchbot_keypad_bridge_ns.class_(
     "AccessControlSwitch", switch.Switch, cg.Component
@@ -180,6 +187,19 @@ CONFIG_SCHEMA = cv.Schema(
         ): cv.All(
             cv.positive_time_period_milliseconds,
             cv.Range(max=TimePeriod(milliseconds=0x7FFFFFFF)),
+        ),
+        # 0s keeps upstream behaviour (the IV survives reconnects indefinitely).
+        cv.Optional(
+            CONF_SESSION_IDLE_TIMEOUT, default="0s"
+        ): cv.positive_time_period_milliseconds,
+        # Brute-force throttle: after this many rejected keypad frames within
+        # `invalid_frame_lockout`, ignore the keypad for that long (0 = off).
+        cv.Optional(CONF_INVALID_FRAME_LIMIT, default=0): cv.int_range(min=0, max=1000),
+        cv.Optional(
+            CONF_INVALID_FRAME_LOCKOUT, default="10min"
+        ): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_ON_TAMPER): automation.validate_automation(
+            {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(TamperTrigger)}
         ),
         cv.Optional(CONF_PAIRING_UI): _deprecated_pairing_ui,
         cv.Optional(CONF_RESET_BUTTON): button.button_schema(
@@ -288,6 +308,17 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     cg.add(var.set_rearm_after(config[CONF_REARM_AFTER].total_milliseconds))
+    cg.add(
+        var.set_session_idle_timeout(
+            config[CONF_SESSION_IDLE_TIMEOUT].total_milliseconds
+        )
+    )
+    cg.add(
+        var.set_invalid_frame_limit(
+            config[CONF_INVALID_FRAME_LIMIT],
+            config[CONF_INVALID_FRAME_LOCKOUT].total_milliseconds,
+        )
+    )
 
     if keypad_conf := config.get(CONF_KEYPAD_ACTION):
         event_types = ["Lock", "Unlock", "Doorbell"]
@@ -353,6 +384,10 @@ async def to_code(config):
         )
 
     for trig_conf in config.get(CONF_ON_DOORBELL, []):
+        trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
+        await automation.build_automation(trig, [], trig_conf)
+
+    for trig_conf in config.get(CONF_ON_TAMPER, []):
         trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trig, [], trig_conf)
 

@@ -35,6 +35,12 @@ void LockSession::reset() {
   this->reset_transport();
 }
 
+void LockSession::expire_committed() {
+  this->active_ = CryptoContext{};
+  this->retired_ = CryptoContext{};
+  this->clear_transient_();
+}
+
 void LockSession::reset_transport() {
   this->clear_transient_();
   this->retired_ = CryptoContext{};
@@ -248,6 +254,7 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
     this->active_.late_action_allowed = false;
     this->active_.handoff_poll_seen = false;
     this->pending_ = CryptoContext{};
+    ++this->generation_;
     ESP_LOGV(TAG, "Pending IV promoted");
   } else if (uses_retired) {
     // response_iv_ already snapshots the matching IV, so the one-frame

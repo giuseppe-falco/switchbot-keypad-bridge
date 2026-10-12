@@ -419,6 +419,9 @@ switchbot_keypad_bridge:
 | `on_lock` | automation | no | Triggered on every `lock` command. |
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |
 | `on_doorbell` | automation | no | Triggered on every doorbell press (Keypad Vision). No parameters. |
+| `session_idle_timeout` | time | no | Forget the keypad's committed IV this long after it disconnects. Default `0s` (never). See [Security limits](#security-limits). |
+| `invalid_frame_limit` / `invalid_frame_lockout` | int / time | no | Ignore the keypad for `invalid_frame_lockout` (default `10min`) after `invalid_frame_limit` rejected frames within that time. Default limit `0` (off). |
+| `on_tamper` | automation | no | Triggered when the invalid-frame lockout starts. No parameters. |
 | `access_control` | block | no | Optional access schedule: `time_id` (required), `enable_switch` (required), `clock_synced`, `rules_status`. See [Access schedule](#-access-schedule-optional). |
 | `on_denied` | automation | no | Triggered when the access schedule rejects an unlock — parameters `(std::string method, int index, std::string reason)`. |
 
@@ -471,6 +474,35 @@ method/credential-byte pair until that IV is discarded, including across
 ordinary BLE reconnects. The history has fixed memory use and never evicts an
 earlier action. Changing ignored trailing bytes or the payload length cannot
 make a repeated decoded action execute again.
+
+Two consequences are easy to underestimate. The bridge encrypts its replies
+with the same IV and counter as the keypad's request, and those replies are
+mostly fixed bytes (a state-poll answer is 13 constant bytes out of 14), so
+**passively sniffing one ordinary keypad exchange reveals keystream for that
+IV**. The IV also survives reconnects until the keypad negotiates a new one —
+by default for as long as nobody uses the keypad. And because a state poll is
+recognised by 3 plaintext bytes, a peer can request its own IV and brute-force
+a poll (about 2^24 writes), whose known reply then leaks keystream too. Both
+paths end in a forged, previously unseen unlock. The reply format is dictated
+by the keypad, so the bridge cannot simply change nonces; it can shrink the
+windows:
+
+```yaml
+switchbot_keypad_bridge:
+  session_idle_timeout: 60s     # forget an IV 60 s after the keypad disconnects
+  invalid_frame_limit: 20       # 20 rejected frames within 10 min ...
+  invalid_frame_lockout: 10min  # ... ignore the keypad for 10 min
+  on_tamper:
+    - homeassistant.event:
+        event: esphome.switchbot_keypad_tamper
+```
+
+`session_idle_timeout` is armed when a committed IV's connection ends and is
+not reset by reconnects or by a peer requesting its own IV; a Keypad Touch
+negotiates a fresh IV on every connection, so it is unaffected (Vision Fast
+Unlock reuse across a long idle gap has not been tested). The throttle turns
+the brute force from hours into years; a genuine keypad essentially never sends
+rejected frames. Both default to off to keep upstream behaviour.
 
 Consequently, a second legitimate identical action in the same IV is also
 dropped: the protocol provides no authenticated per-command counter to tell

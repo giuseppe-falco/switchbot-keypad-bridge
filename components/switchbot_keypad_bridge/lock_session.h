@@ -59,6 +59,15 @@ class LockSession {
   // Forget the learned token slot as well (pairing reset only).
   void forget_slot() { this->slot_id_ = 0x00; }
 
+  // Drop the committed IV generations (active and retired) but keep a pending
+  // IV that is mid-handshake. Used to bound how long an idle IV stays usable:
+  // CTR without a MAC lets anyone who learned its keystream forge commands.
+  void expire_committed();
+
+  // Bumped every time a pending IV is committed. Lets the bridge tell whether
+  // the generation it armed an idle timer for has since been replaced.
+  uint32_t generation() const { return this->generation_; }
+
   // Validate, decrypt and decode one received frame. On COMMAND the decoded
   // result is available via header()/command() until the next call.
   Action process_frame(const std::string &frame);
@@ -131,6 +140,7 @@ class LockSession {
   // boundary, slot change or reset discards it. pending_ and retired_ never
   // coexist.
   CryptoContext retired_{};
+  uint32_t generation_{0};
 
   std::array<uint8_t, 20> iv_response_{0x01, 0x00, 0x00, 0x00};
 

@@ -258,6 +258,7 @@ void SwitchbotKeypadBridge::loop() {
   this->apply_pending_lock_link_();
   this->apply_pending_lock_relay_();
   this->update_rearm_timer_();
+  this->expire_idle_session_();
 #ifdef USE_SKB_ACCESS_CONTROL
   this->update_clock_synced_();
 #endif
@@ -285,8 +286,19 @@ void SwitchbotKeypadBridge::loop() {
     } else if (ev.type == QueuedEvent::DISCONNECT) {
       ESP_LOGI(TAG, "Keypad disconnected, restarting advertising");
       this->session_.reset_transport();
+      if (this->session_idle_timeout_ms_ != 0 &&
+          (!this->session_idle_armed_ ||
+           this->session_idle_generation_ != this->session_.generation())) {
+        this->session_idle_armed_ = true;
+        this->session_idle_since_ = millis();
+        this->session_idle_generation_ = this->session_.generation();
+      }
       NimBLEDevice::startAdvertising();
     } else if (ev.type == QueuedEvent::RX) {
+      if (this->frame_throttle_.blocked(millis())) {
+        ESP_LOGV(TAG, "Ignoring keypad frame during invalid-frame lockout");
+        continue;
+      }
       this->on_rx_frame_(ev.frame);
     }
   }
@@ -544,6 +556,31 @@ void SwitchbotKeypadBridge::rearm() {
   ESP_LOGI(TAG, "Reporting locked state on the next keypad poll (rearm)");
 }
 
+void SwitchbotKeypadBridge::expire_idle_session_() {
+  if (!this->session_idle_armed_ ||
+      millis() - this->session_idle_since_ < this->session_idle_timeout_ms_) {
+    return;
+  }
+  this->session_idle_armed_ = false;
+  if (this->session_.generation() != this->session_idle_generation_) {
+    return;  // the keypad already moved to a new IV; that one arms on its own
+  }
+  // Like a reboot for the committed IV: the keypad negotiates a new one on its
+  // next connection; a pending IV mid-handshake is kept.
+  this->session_.expire_committed();
+  ESP_LOGD(TAG, "Keypad session expired after %us idle",
+           static_cast<unsigned>(this->session_idle_timeout_ms_ / 1000));
+}
+
+void SwitchbotKeypadBridge::on_invalid_frame_flood_() {
+  ESP_LOGW(TAG, "Too many invalid keypad frames: ignoring the keypad for a while "
+                "(possible brute-force attempt)");
+  // Discard every IV, including one a brute-forcing peer requested for itself.
+  this->session_.reset();
+  this->session_idle_armed_ = false;
+  this->on_tamper_callbacks_.call();
+}
+
 void SwitchbotKeypadBridge::update_rearm_timer_() {
   if (this->keypad_state_.update(millis())) {
     ESP_LOGI(TAG, "Face/palm rearm timer expired; reporting locked state on the next keypad poll");
@@ -556,6 +593,10 @@ void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "  Setup UI: port 80");
   ESP_LOGCONFIG(TAG, "  Face/palm rearm after: %ums (0 = disabled)",
                 static_cast<unsigned>(this->keypad_state_.rearm_after()));
+  ESP_LOGCONFIG(TAG, "  Session idle timeout: %ums (0 = never)",
+                static_cast<unsigned>(this->session_idle_timeout_ms_));
+  ESP_LOGCONFIG(TAG, "  Invalid-frame throttle: %s",
+                this->frame_throttle_.enabled() ? "enabled" : "disabled");
   ESP_LOGCONFIG(TAG, "  Physical lock relay: %s",
                 this->lock_linked_ ? this->linked_lock_info_.name : "Unlinked");
   if (this->keypad_battery_level_sensor_ != nullptr ||
@@ -669,7 +710,11 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
       return;
     case LockSession::Action::NONE:
     default:
-      return;  // dropped — the session logged why
+      // Dropped — the session logged why. Count it towards the throttle.
+      if (this->frame_throttle_.record_invalid(millis())) {
+        this->on_invalid_frame_flood_();
+      }
+      return;
   }
 }
 

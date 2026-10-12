@@ -1023,6 +1023,49 @@ bool aes_ctr_xcrypt(psa_key_id_t key, const uint8_t iv[16],
 }  // namespace switchbot_keypad_bridge
 }  // namespace esphome
 
+void test_expire_committed_keeps_pending_handshake() {
+  LockSession session;
+  session.set_aes_key(TEST_KEY);
+
+  // A committed generation, as after a normal keypad interaction.
+  const auto old_iv = make_iv(0x31);
+  queue_iv(old_iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  const uint32_t before = session.generation();
+  assert(session.process_frame(encrypted_frame(old_iv, STATE_POLL)) ==
+         LockSession::Action::COMMAND);
+  assert(session.generation() == before + 1);
+
+  // A peer requests its own IV but cannot complete a valid frame under it:
+  // the generation does not move, so an idle timer armed for old_iv stays due.
+  const auto peer_iv = make_iv(0x51);
+  queue_iv(peer_iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  assert(session.process_frame(encrypted_frame(peer_iv, UNKNOWN)) ==
+         LockSession::Action::NONE);
+  assert(session.generation() == before + 1);
+
+  // Expiry drops the committed IV: a forged action under it is refused...
+  session.expire_committed();
+  assert(session.process_frame(encrypted_frame(old_iv, FINGERPRINT_UNLOCK)) ==
+         LockSession::Action::NONE);
+  // ...while a handshake that was already in progress can still complete.
+  assert(session.process_frame(encrypted_frame(peer_iv, STATE_POLL)) ==
+         LockSession::Action::COMMAND);
+  assert(session.generation() == before + 2);
+
+  // Expiring with nothing pending leaves no IV at all, like a reboot: the
+  // keypad must negotiate again and then works normally.
+  session.expire_committed();
+  assert(session.process_frame(encrypted_frame(peer_iv, STATE_POLL)) ==
+         LockSession::Action::NONE);
+  const auto next_iv = make_iv(0x71);
+  queue_iv(next_iv);
+  assert(session.process_frame(iv_request()) == LockSession::Action::SEND_IV);
+  assert(session.process_frame(encrypted_frame(next_iv, FINGERPRINT_UNLOCK)) ==
+         LockSession::Action::COMMAND);
+}
+
 int main() {
   test_iv_handoff_and_replay();
   test_fast_unlock_before_pending_promotion();
@@ -1049,6 +1092,7 @@ int main() {
   test_unknown_commands_and_methods_are_dropped();
   test_palm_unlock_uses_one_shot_handoff();
   test_unsupported_pending_frame_closes_action_handoff();
+  test_expire_committed_keeps_pending_handshake();
   assert(random_values.empty());
   return 0;
 }
